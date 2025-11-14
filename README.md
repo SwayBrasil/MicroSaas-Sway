@@ -1,4 +1,6 @@
-# MicroSaaS – MVP Chat (Web + WhatsApp)
+# MicroSaas-Arejano
+
+MVP Chat (Web + WhatsApp) para Gráfica Arejano
 
 Assistente conversacional full-stack com **FastAPI**, **React (Vite)** e integração **WhatsApp (Twilio Sandbox)**. Inclui login JWT, chat com histórico, dashboard/estatísticas e perfil.
 
