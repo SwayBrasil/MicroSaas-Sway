@@ -1100,12 +1100,33 @@ async def meta_webhook(req: Request, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(owner)
 
+    # Normaliza o número do Meta também
+    from_ = _normalize_phone(from_)
+    
+    # Busca thread existente - normaliza o número do banco também para comparação
     t = (
         db.query(Thread)
         .filter(Thread.user_id == owner.id, Thread.external_user_phone == from_)
         .order_by(Thread.id.desc())
         .first()
     )
+    
+    # Se não encontrou, tenta buscar normalizando os números do banco
+    if not t:
+        all_threads = (
+            db.query(Thread)
+            .filter(Thread.user_id == owner.id)
+            .all()
+        )
+        for thread in all_threads:
+            if thread.external_user_phone and _normalize_phone(thread.external_user_phone) == from_:
+                t = thread
+                # Atualiza o número no banco para o formato normalizado
+                if thread.external_user_phone != from_:
+                    thread.external_user_phone = from_
+                    db.commit()
+                    db.refresh(thread)
+                break
     
     # Prepara o metadata com o nome do perfil se disponível
     meta_data = {}
@@ -1207,6 +1228,26 @@ async def meta_webhook(req: Request, db: Session = Depends(get_db)):
 # -----------------------------
 # Webhooks WhatsApp - Twilio
 # -----------------------------
+def _normalize_phone(phone: str) -> str:
+    """
+    Normaliza número de telefone para formato E.164 consistente.
+    Remove 'whatsapp:', espaços, e garante que comece com '+'.
+    Exemplos:
+    - 'whatsapp:+556184081114' -> '+556184081114'
+    - '+556184081114' -> '+556184081114'
+    - '556184081114' -> '+556184081114'
+    """
+    if not phone:
+        return ""
+    # Remove 'whatsapp:' prefix
+    normalized = str(phone).replace("whatsapp:", "").strip()
+    # Remove espaços e caracteres especiais (exceto +)
+    normalized = normalized.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+    # Garante que comece com +
+    if normalized and not normalized.startswith("+"):
+        normalized = "+" + normalized
+    return normalized
+
 @app.post("/webhooks/twilio")
 async def twilio_webhook(req: Request, db: Session = Depends(get_db)):
     import logging
@@ -1215,7 +1256,8 @@ async def twilio_webhook(req: Request, db: Session = Depends(get_db)):
     
     try:
         form = await req.form()
-        from_ = str(form.get("From", "")).replace("whatsapp:", "")
+        from_raw = str(form.get("From", ""))
+        from_ = _normalize_phone(from_raw)  # Normaliza o número
         body = form.get("Body", "") or ""
         
         # Detecta mídia (Twilio envia NumMedia quando há anexos)
@@ -1240,12 +1282,33 @@ async def twilio_webhook(req: Request, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(owner)
 
+    # Busca thread existente - normaliza o número do banco também para comparação
+    # Busca por número exato primeiro
     t = (
         db.query(Thread)
         .filter(Thread.user_id == owner.id, Thread.external_user_phone == from_)
         .order_by(Thread.id.desc())
         .first()
     )
+    
+    # Se não encontrou, tenta buscar normalizando os números do banco
+    if not t:
+        logger.info(f"[WEBHOOK-TWILIO] Thread não encontrada com número exato '{from_}', buscando com normalização...")
+        all_threads = (
+            db.query(Thread)
+            .filter(Thread.user_id == owner.id)
+            .all()
+        )
+        for thread in all_threads:
+            if thread.external_user_phone and _normalize_phone(thread.external_user_phone) == from_:
+                logger.info(f"[WEBHOOK-TWILIO] Thread encontrada! ID={thread.id}, número antigo='{thread.external_user_phone}', normalizando para '{from_}'")
+                t = thread
+                # Atualiza o número no banco para o formato normalizado
+                if thread.external_user_phone != from_:
+                    thread.external_user_phone = from_
+                    db.commit()
+                    db.refresh(thread)
+                break
     
     # Prepara o metadata com o nome do perfil se disponível
     meta_data = {}
