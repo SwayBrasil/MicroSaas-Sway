@@ -1327,17 +1327,35 @@ async def twilio_webhook(req: Request, db: Session = Depends(get_db)):
                 .filter(Thread.external_user_phone.isnot(None))
                 .all()
             )
+            # Coleta todas as threads com o mesmo número (pode haver duplicatas)
+            matching_threads = []
             for thread in all_threads_global:
                 if thread.external_user_phone and _normalize_phone(thread.external_user_phone) == from_:
-                    logger.warning(f"[WEBHOOK-TWILIO] ⚠️ Thread encontrada em OUTRO usuário! ID={thread.id}, user_id={thread.user_id}, migrando para user_id={owner.id}")
-                    # Migra a thread para o usuário atual
-                    thread.user_id = owner.id
-                    if thread.external_user_phone != from_:
-                        thread.external_user_phone = from_
-                    db.commit()
-                    db.refresh(thread)
-                    t = thread
-                    break
+                    matching_threads.append(thread)
+            
+            if matching_threads:
+                # Se houver múltiplas, usa a mais recente (maior ID)
+                matching_threads.sort(key=lambda x: x.id, reverse=True)
+                t = matching_threads[0]
+                
+                # Migra para o usuário correto se necessário
+                if t.user_id != owner.id:
+                    logger.warning(f"[WEBHOOK-TWILIO] ⚠️ Thread encontrada em OUTRO usuário! ID={t.id}, user_id={t.user_id}, migrando para user_id={owner.id}")
+                    t.user_id = owner.id
+                
+                # Normaliza o número se necessário
+                if t.external_user_phone != from_:
+                    logger.info(f"[WEBHOOK-TWILIO] Atualizando número no banco de '{t.external_user_phone}' para '{from_}'")
+                    t.external_user_phone = from_
+                
+                # Se houver threads duplicadas, marca as outras para possível limpeza futura
+                if len(matching_threads) > 1:
+                    logger.warning(f"[WEBHOOK-TWILIO] ⚠️ Encontradas {len(matching_threads)} threads duplicadas para número '{from_}'. Usando thread ID={t.id} (mais recente).")
+                    for dup_thread in matching_threads[1:]:
+                        logger.warning(f"[WEBHOOK-TWILIO] ⚠️ Thread duplicada ID={dup_thread.id} será ignorada (mensagens devem ir para thread {t.id})")
+                
+                db.commit()
+                db.refresh(t)
     else:
         logger.info(f"[WEBHOOK-TWILIO] ✅ Thread encontrada por busca exata: ID={t.id}, número='{from_}'")
     
