@@ -1,8 +1,17 @@
 // frontend/src/api.ts
 import axios from "axios";
 
+// Descobre a base da API:
+// - Se tiver VITE_API_BASE_URL no build, usa ela
+// - Se estiver rodando em localhost, usa http://localhost:8000
+// - Se estiver em produção (domínio), usa "/api" (vai passar pelo Caddy)
+const isLocalhost =
+  window.location.hostname === "localhost" ||
+  window.location.hostname === "127.0.0.1";
+
 export const API_BASE =
-  import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+  (import.meta as any).env?.VITE_API_BASE_URL ||
+  (isLocalhost ? "http://localhost:8000" : "/api");
 
 const api = axios.create({
   baseURL: API_BASE,
