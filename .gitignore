@@ -32,6 +32,9 @@ infra/db_data/
 infra/.env
 infra/.env.local
 infra/.env.*.local
+infra/.env.bak
+*.env.bak
+.env.bak
 
 # Ngrok
 .ngrok2/
