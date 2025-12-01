@@ -3,13 +3,17 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.db import get_db
 from app.models import Thread, Message, User
-from app.schemas import TakeoverToggle, HumanReplyBody
+from app.schemas import TakeoverToggle, HumanReplyBody, MessageRead
 from app.auth import get_current_user
 
-# ✅ provider Twilio
+# ✅ providers
 from app.providers import twilio as twilio_provider
+from app.providers import meta as meta_provider
+import asyncio
+import logging
 
 router = APIRouter(prefix="/threads", tags=["takeover"])
+logger = logging.getLogger(__name__)
 
 @router.post("/{thread_id}/takeover")
 def set_takeover(thread_id: int, body: TakeoverToggle,
@@ -22,10 +26,10 @@ def set_takeover(thread_id: int, body: TakeoverToggle,
     db.add(t); db.commit(); db.refresh(t)
     return {"ok": True, "human_takeover": t.human_takeover}
 
-@router.post("/{thread_id}/human-reply")
-def human_reply(thread_id: int, body: HumanReplyBody,
-                user: User = Depends(get_current_user),
-                db: Session = Depends(get_db)):
+@router.post("/{thread_id}/human-reply", response_model=MessageRead)
+async def human_reply(thread_id: int, body: HumanReplyBody,
+                 user: User = Depends(get_current_user),
+                 db: Session = Depends(get_db)):
     t = db.get(Thread, thread_id)
     if not t:
         raise HTTPException(404, "Thread not found")
@@ -34,18 +38,33 @@ def human_reply(thread_id: int, body: HumanReplyBody,
     msg = Message(thread_id=t.id, role="assistant", content=body.content, is_human=True)
     db.add(msg); db.commit(); db.refresh(msg)
 
-    # 2) envia para o cliente via Twilio
+    # 2) envia para o cliente via WhatsApp (Twilio ou Meta)
     phone = (t.external_user_phone or "").strip()
     if not phone:
-        print(f"[HUMAN-REPLY] thread {t.id} sem external_user_phone; nada enviado")
+        logger.warning(f"[HUMAN-REPLY] thread {t.id} sem external_user_phone; nada enviado")
         return {"ok": True, "message_id": msg.id, "sent": False}
 
+    sent = False
+    # Tenta enviar via Twilio primeiro
     try:
-        sid = twilio_provider.send_text(phone, body.content)  # <- síncrono, sem await
-        print(f"[HUMAN-REPLY][TWILIO] thread={t.id} to={phone} sid={sid}")
+        sid = twilio_provider.send_text(phone, body.content, "HUMANO")
+        logger.info(f"[HUMAN-REPLY][TWILIO] ✅ thread={t.id} to={phone} sid={sid}")
         sent = True
-    except Exception as e:
-        print(f"[HUMAN-REPLY][TWILIO][ERROR] thread={t.id} to={phone} err={e}")
-        sent = False
+    except Exception as twilio_error:
+        logger.warning(f"[HUMAN-REPLY][TWILIO] ⚠️ Falhou para {phone}: {twilio_error}")
+        # Se Twilio falhar, tenta Meta
+        try:
+            phone_for_meta = phone.replace("whatsapp:", "").replace("+", "").strip()
+            await meta_provider.send_text(phone_for_meta, body.content)
+            logger.info(f"[HUMAN-REPLY][META] ✅ thread={t.id} to={phone} (formatado: {phone_for_meta})")
+            sent = True
+        except Exception as meta_error:
+            logger.error(f"[HUMAN-REPLY] ❌ Falha ao enviar via ambos os provedores. Twilio: {twilio_error}, Meta: {meta_error}")
+            sent = False
 
-    return {"ok": True, "message_id": msg.id, "sent": sent}
+    return MessageRead(
+        id=msg.id,
+        role=msg.role,
+        content=msg.content,
+        created_at=msg.created_at,
+    )

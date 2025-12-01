@@ -848,6 +848,29 @@ async def stream_thread(
     return StreamingResponse(event_gen(), media_type="text/event-stream", headers=headers)
 
 # -----------------------------
+# Helpers
+# -----------------------------
+def _normalize_phone(phone: str) -> str:
+    """
+    Normaliza número de telefone para formato E.164 consistente.
+    Remove 'whatsapp:', espaços, e garante que comece com '+'.
+    Exemplos:
+    - 'whatsapp:+556184081114' -> '+556184081114'
+    - '+556184081114' -> '+556184081114'
+    - '556184081114' -> '+556184081114'
+    """
+    if not phone:
+        return ""
+    # Remove 'whatsapp:' prefix
+    normalized = str(phone).replace("whatsapp:", "").strip()
+    # Remove espaços e caracteres especiais (exceto +)
+    normalized = normalized.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+    # Garante que comece com +
+    if normalized and not normalized.startswith("+"):
+        normalized = "+" + normalized
+    return normalized
+
+# -----------------------------
 # Threads (sem response_model)
 # -----------------------------
 @app.get("/threads")
@@ -890,10 +913,87 @@ def create_thread(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    t = Thread(user_id=user.id, title=body.title or "Nova conversa")
+    # Normaliza o telefone se fornecido
+    phone = None
+    if body.phone:
+        phone = _normalize_phone(body.phone)
+        
+        # Verifica se já existe uma thread com este telefone
+        # Busca por número exato primeiro
+        existing_thread = (
+            db.query(Thread)
+            .filter(Thread.external_user_phone == phone)
+            .order_by(Thread.id.desc())
+            .first()
+        )
+        
+        # Se não encontrou, busca normalizando todos os números do banco
+        if not existing_thread:
+            all_threads = (
+                db.query(Thread)
+                .filter(Thread.external_user_phone.isnot(None))
+                .all()
+            )
+            for thread in all_threads:
+                if thread.external_user_phone and _normalize_phone(thread.external_user_phone) == phone:
+                    existing_thread = thread
+                    # Atualiza o número no banco para o formato normalizado
+                    if thread.external_user_phone != phone:
+                        thread.external_user_phone = phone
+                        db.commit()
+                        db.refresh(thread)
+                    break
+        
+        # Se encontrou thread existente, retorna erro
+        if existing_thread:
+            from fastapi import HTTPException
+            raise HTTPException(
+                status_code=400,
+                detail=f"Já existe um contato com este número. Thread ID: {existing_thread.id}"
+            )
+    
+    # Determina o título: usa o nome se fornecido, senão usa o título, senão usa padrão
+    title = body.name or body.title or (f"Contato {phone[-4:]}" if phone else "Nova conversa")
+    
+    # Cria a thread
+    # Se tiver telefone, ativa takeover automaticamente (modo manual)
+    t = Thread(
+        user_id=user.id,
+        title=title,
+        external_user_phone=phone,
+        human_takeover=True if phone else False  # Ativa takeover se tiver telefone
+    )
+    
+    # Adiciona metadata se tiver nome ou telefone
+    if body.name or phone:
+        meta_data = {}
+        if body.name:
+            meta_data["name"] = body.name
+            meta_data["profile_name"] = body.name
+        if phone:
+            meta_data["wa_id"] = phone
+            meta_data["phone"] = phone
+        t.meta = meta_data if meta_data else None
+    
     db.add(t)
     db.commit()
     db.refresh(t)
+    
+    # Cria o contato automaticamente se tiver nome ou telefone
+    if body.name or phone:
+        from .models import Contact
+        contact = db.query(Contact).filter(Contact.thread_id == t.id).first()
+        if not contact:
+            contact = Contact(
+                thread_id=t.id,
+                user_id=user.id,
+                phone=phone,
+                name=body.name or title,
+            )
+            db.add(contact)
+            db.commit()
+            db.refresh(contact)
+    
     return _serialize_thread(t, db)
 
 @app.patch("/threads/{thread_id}")
@@ -999,7 +1099,32 @@ async def send_message(
         },
     )
 
+    # Se human_takeover está ativo, envia a mensagem do usuário via WhatsApp e não chama LLM
     if getattr(t, "human_takeover", False):
+        # Envia a mensagem do usuário via WhatsApp
+        phone = getattr(t, "external_user_phone", None)
+        if phone and phone.strip():
+            phone_clean = phone.strip()
+            import logging
+            logger = logging.getLogger(__name__)
+            
+            # Tenta enviar via Twilio primeiro
+            sent = False
+            try:
+                sid = await asyncio.to_thread(twilio_provider.send_text, phone_clean, body.content, "HUMANO")
+                logger.info(f"[SEND-MESSAGE][USER] ✅ Mensagem do usuário enviada via Twilio para {phone_clean}, SID: {sid}")
+                sent = True
+            except Exception as twilio_error:
+                logger.warning(f"[SEND-MESSAGE][USER] ⚠️ Twilio falhou para {phone_clean}: {twilio_error}")
+                # Se Twilio falhar, tenta Meta
+                try:
+                    phone_for_meta = phone_clean.replace("whatsapp:", "").replace("+", "").strip()
+                    await meta_provider.send_text(phone_for_meta, body.content)
+                    logger.info(f"[SEND-MESSAGE][USER] ✅ Mensagem do usuário enviada via Meta para {phone_clean}")
+                    sent = True
+                except Exception as meta_error:
+                    logger.error(f"[SEND-MESSAGE][USER] ❌ Falha ao enviar mensagem do usuário. Twilio: {twilio_error}, Meta: {meta_error}")
+        
         return MessageRead(
             id=m_user.id,
             role=m_user.role,
@@ -1044,6 +1169,35 @@ async def send_message(
             },
         },
     )
+
+    # Envia a resposta via WhatsApp se a thread tiver telefone
+    phone = getattr(t, "external_user_phone", None)
+    if phone and phone.strip():
+        phone_clean = phone.strip()
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # Tenta enviar via Twilio primeiro (mais comum)
+        sent = False
+        try:
+            sid = await asyncio.to_thread(twilio_provider.send_text, phone_clean, reply, "BOT")
+            logger.info(f"[SEND-MESSAGE] ✅ Resposta enviada via Twilio para {phone_clean}, SID: {sid}")
+            sent = True
+        except Exception as twilio_error:
+            logger.warning(f"[SEND-MESSAGE] ⚠️ Twilio falhou para {phone_clean}: {twilio_error}")
+            # Se Twilio falhar, tenta Meta
+            try:
+                # Meta espera número sem o "+" e sem prefixo "whatsapp:"
+                # Remove "whatsapp:" se houver e depois remove o "+"
+                phone_for_meta = phone_clean.replace("whatsapp:", "").replace("+", "").strip()
+                await meta_provider.send_text(phone_for_meta, reply)
+                logger.info(f"[SEND-MESSAGE] ✅ Resposta enviada via Meta para {phone_clean} (formatado: {phone_for_meta})")
+                sent = True
+            except Exception as meta_error:
+                logger.error(f"[SEND-MESSAGE] ❌ Falha ao enviar via ambos os provedores. Twilio: {twilio_error}, Meta: {meta_error}")
+        
+        if not sent:
+            logger.error(f"[SEND-MESSAGE] ❌ Não foi possível enviar mensagem para {phone_clean} via nenhum provedor")
 
     return MessageRead(
         id=m_assist.id,
@@ -1228,26 +1382,6 @@ async def meta_webhook(req: Request, db: Session = Depends(get_db)):
 # -----------------------------
 # Webhooks WhatsApp - Twilio
 # -----------------------------
-def _normalize_phone(phone: str) -> str:
-    """
-    Normaliza número de telefone para formato E.164 consistente.
-    Remove 'whatsapp:', espaços, e garante que comece com '+'.
-    Exemplos:
-    - 'whatsapp:+556184081114' -> '+556184081114'
-    - '+556184081114' -> '+556184081114'
-    - '556184081114' -> '+556184081114'
-    """
-    if not phone:
-        return ""
-    # Remove 'whatsapp:' prefix
-    normalized = str(phone).replace("whatsapp:", "").strip()
-    # Remove espaços e caracteres especiais (exceto +)
-    normalized = normalized.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
-    # Garante que comece com +
-    if normalized and not normalized.startswith("+"):
-        normalized = "+" + normalized
-    return normalized
-
 @app.post("/webhooks/twilio")
 async def twilio_webhook(req: Request, db: Session = Depends(get_db)):
     import logging

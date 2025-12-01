@@ -33,6 +33,8 @@ class MessageRead(BaseModel):
 # ================== Threads ==================
 class ThreadCreate(BaseModel):
     title: Optional[str] = None
+    phone: Optional[str] = None
+    name: Optional[str] = None
 
 
 class ThreadUpdate(BaseModel):

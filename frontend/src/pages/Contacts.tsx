@@ -1,7 +1,7 @@
 // frontend/src/pages/Contacts.tsx
 import React, { useEffect, useMemo, useState } from "react";
-import { Link } from "react-router-dom";
-import { listThreads, updateThread, getMessages, type Thread } from "../api";
+import { Link, useNavigate } from "react-router-dom";
+import { listThreads, updateThread, getMessages, createContactAndSendMessage, type Thread } from "../api";
 import { getOverrideLevel, type LeadLevel } from "../hooks/useLeadScore";
 import { computeLeadScoreFromMessages, levelFromScore } from "../utils/leadScore";
 import type { UIMessage } from "../types/lead";
@@ -63,6 +63,7 @@ function fmtTimeShort(iso?: string) {
 }
 
 export default function Contacts() {
+  const navigate = useNavigate();
   const [rows, setRows] = useState<Row[]>([]);
   const [loading, setLoading] = useState(true);
   const [q, setQ] = useState("");
@@ -70,6 +71,15 @@ export default function Contacts() {
   const [level, setLevel] = useState<"todos" | "frio" | "morno" | "quente">("todos");
   const [sort, setSort] = useState<{ key: string; dir: "asc" | "desc" }>({ key: "ultimo", dir: "desc" });
   const [isMobile, setIsMobile] = useState(window.innerWidth < 768);
+  
+  // Modal para criar novo contato
+  const [showNewContactModal, setShowNewContactModal] = useState(false);
+  const [newContactName, setNewContactName] = useState("");
+  const [newContactPhone, setNewContactPhone] = useState("");
+  const [newContactMessage, setNewContactMessage] = useState("");
+  const [creatingContact, setCreatingContact] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [existingThreadId, setExistingThreadId] = useState<string | null>(null);
 
   useEffect(() => {
     const handleResize = () => setIsMobile(window.innerWidth < 768);
@@ -243,6 +253,130 @@ export default function Contacts() {
     setSort(s => (s.key === key ? { key, dir: s.dir === "asc" ? "desc" : "asc" } : { key, dir: "asc" }));
   }
 
+  // Função para validar e formatar telefone
+  function validateAndFormatPhone(phone: string): string | null {
+    // Remove espaços, parênteses, hífens e outros caracteres
+    let cleaned = phone.replace(/[\s\(\)\-\.]/g, "");
+    
+    // Remove o prefixo "whatsapp:" se existir
+    cleaned = cleaned.replace(/^whatsapp:/i, "");
+    
+    // Se começar com +, remove temporariamente
+    const hasPlus = cleaned.startsWith("+");
+    if (hasPlus) {
+      cleaned = cleaned.substring(1);
+    }
+    
+    // Remove o "9" inicial se o número tiver 11 dígitos e começar com 9
+    // Isso é para números brasileiros no formato: 961984081114 -> 6184081114
+    if (cleaned.length === 11 && cleaned.startsWith("9")) {
+      cleaned = cleaned.substring(1);
+    }
+    
+    // Se o número tem 10 dígitos e começa com código de área brasileiro (11-99), adiciona código do país
+    if (cleaned.length === 10 && /^[1-9][1-9]/.test(cleaned)) {
+      cleaned = "55" + cleaned; // Adiciona código do Brasil
+    }
+    
+    // Validação básica: deve ter pelo menos 10 dígitos (DDD + número)
+    if (cleaned.length < 10) {
+      return null;
+    }
+    
+    // Garante que começa com +
+    return "+" + cleaned;
+  }
+
+  async function handleCreateContactAndSend() {
+    if (!newContactName.trim() || !newContactPhone.trim() || !newContactMessage.trim()) {
+      setErrorMsg("Por favor, preencha todos os campos.");
+      return;
+    }
+
+    // Valida e formata o telefone
+    const formattedPhone = validateAndFormatPhone(newContactPhone.trim());
+    if (!formattedPhone) {
+      setErrorMsg("Telefone inválido. Use o formato: +5511984081114 ou 6184081114");
+      return;
+    }
+
+    setCreatingContact(true);
+    setErrorMsg(null);
+
+    try {
+      const { thread } = await createContactAndSendMessage(
+        newContactName.trim(),
+        formattedPhone,
+        newContactMessage.trim()
+      );
+
+      // Recarrega a lista de contatos
+      const ts = await listThreads();
+      const base: Row[] = ts.map(t => {
+        const beScore = (t as any).lead_score as number | undefined;
+        const beLevel = (t as any).lead_level as LeadLevel | undefined;
+        const override = getOverrideLevel(String(t.id));
+        const levelEff: LeadLevel =
+          override && override !== "desconhecido"
+            ? override
+            : beLevel ?? levelFromScore(beScore);
+        const scoreEff = typeof beScore === "number" ? beScore : undefined;
+        
+        const lastText = t.last_message || undefined;
+        const lastAt = t.last_message_at || undefined;
+        
+        return { 
+          ...t, 
+          _phone: getPhone(t), 
+          _level: levelEff, 
+          _score: scoreEff,
+          _lastText: lastText,
+          _lastAt: lastAt,
+        };
+      });
+      setRows(base);
+
+      // Fecha o modal e limpa os campos
+      setShowNewContactModal(false);
+      setNewContactName("");
+      setNewContactPhone("");
+      setNewContactMessage("");
+
+      // Navega para o chat com a nova thread
+      navigate(`/#/chat?thread=${thread.id}`);
+    } catch (e: any) {
+      const errorDetail = e?.response?.data?.detail || e?.message || "Falha ao criar contato e enviar mensagem.";
+      
+      // Se o erro for sobre número duplicado, mostra mensagem mais clara
+      if (errorDetail.includes("Já existe um contato") || errorDetail.includes("já existe")) {
+        const threadIdMatch = errorDetail.match(/Thread ID: (\d+)/);
+        if (threadIdMatch) {
+          const threadId = threadIdMatch[1];
+          setExistingThreadId(threadId);
+          setErrorMsg(`Este número já está cadastrado. Clique em "Abrir conversa existente" para continuar.`);
+        } else {
+          setErrorMsg("Este número já está cadastrado. Verifique a lista de contatos.");
+        }
+      } else {
+        setErrorMsg(errorDetail);
+      }
+    } finally {
+      setCreatingContact(false);
+    }
+  }
+
+  function handleOpenExistingThread() {
+    if (existingThreadId) {
+      navigate(`/#/chat?thread=${existingThreadId}`);
+      setShowNewContactModal(false);
+      setNewContactName("");
+      setNewContactPhone("");
+      setNewContactMessage("");
+      setExistingThreadId(null);
+      setErrorMsg(null);
+    }
+  }
+
   return (
     <div style={{ 
       height: "calc(100vh - 56px)", 
@@ -263,6 +397,25 @@ export default function Contacts() {
           flexWrap: isMobile ? "wrap" : "nowrap",
         }}
       >
+        <button
+          onClick={() => setShowNewContactModal(true)}
+          className="btn"
+          style={{
+            padding: isMobile ? "8px 12px" : "10px 16px",
+            background: "var(--primary-color)",
+            color: "white",
+            border: "none",
+            borderRadius: 8,
+            fontSize: isMobile ? 13 : 14,
+            fontWeight: 600,
+            cursor: "pointer",
+            whiteSpace: "nowrap",
+            flexShrink: 0,
+          }}
+          title="Criar novo contato e enviar mensagem"
+        >
+          + Novo Contato
+        </button>
         <input
           className="input"
           placeholder={isMobile ? "Buscar..." : "Buscar (nome, número, mensagem)..."}
@@ -531,6 +684,232 @@ export default function Contacts() {
             );
           })}
         </div>
+      )}
+
+      {/* Modal para criar novo contato */}
+      {showNewContactModal && (
+        <>
+          <div
+            style={{
+              position: "fixed",
+              top: 0,
+              left: 0,
+              right: 0,
+              bottom: 0,
+              background: "rgba(0, 0, 0, 0.5)",
+              zIndex: 10000,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              padding: isMobile ? 16 : 20,
+            }}
+            onClick={() => {
+              if (!creatingContact) {
+                setShowNewContactModal(false);
+                setNewContactName("");
+                setNewContactPhone("");
+                setNewContactMessage("");
+                setErrorMsg(null);
+              }
+            }}
+          >
+            <div
+              className="card"
+              style={{
+                background: "var(--panel)",
+                border: "1px solid var(--border)",
+                borderRadius: 12,
+                padding: isMobile ? 20 : 24,
+                maxWidth: isMobile ? "100%" : 500,
+                width: "100%",
+                maxHeight: "90vh",
+                overflowY: "auto",
+                boxShadow: "0 8px 24px rgba(0,0,0,0.3)",
+              }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h2 style={{ margin: "0 0 20px 0", fontSize: isMobile ? 20 : 24, fontWeight: 600 }}>
+                Novo Contato
+              </h2>
+
+              <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+                <div>
+                  <label
+                    style={{
+                      display: "block",
+                      marginBottom: 8,
+                      fontSize: 14,
+                      fontWeight: 500,
+                      color: "var(--text)",
+                    }}
+                  >
+                    Nome *
+                  </label>
+                  <input
+                    className="input"
+                    type="text"
+                    value={newContactName}
+                    onChange={(e) => setNewContactName(e.target.value)}
+                    placeholder="Nome do contato"
+                    disabled={creatingContact}
+                    style={{ width: "100%", fontSize: 14 }}
+                  />
+                </div>
+
+                <div>
+                  <label
+                    style={{
+                      display: "block",
+                      marginBottom: 8,
+                      fontSize: 14,
+                      fontWeight: 500,
+                      color: "var(--text)",
+                    }}
+                  >
+                    Telefone *
+                  </label>
+                  <input
+                    className="input"
+                    type="tel"
+                    value={newContactPhone}
+                    onChange={(e) => {
+                      setNewContactPhone(e.target.value);
+                      // Limpa o erro e thread existente quando o usuário digita
+                      if (errorMsg || existingThreadId) {
+                        setErrorMsg(null);
+                        setExistingThreadId(null);
+                      }
+                    }}
+                    placeholder="+5511984081114 ou 6184081114"
+                    disabled={creatingContact}
+                    style={{ width: "100%", fontSize: 14 }}
+                  />
+                  <div className="small" style={{ marginTop: 4, color: "var(--muted)" }}>
+                    Formato: +5511984081114 ou 6184081114 (sem o 9 na frente)
+                  </div>
+                </div>
+
+                <div>
+                  <label
+                    style={{
+                      display: "block",
+                      marginBottom: 8,
+                      fontSize: 14,
+                      fontWeight: 500,
+                      color: "var(--text)",
+                    }}
+                  >
+                    Mensagem Inicial *
+                  </label>
+                  <textarea
+                    className="input"
+                    value={newContactMessage}
+                    onChange={(e) => setNewContactMessage(e.target.value)}
+                    placeholder="Digite a mensagem que deseja enviar..."
+                    disabled={creatingContact}
+                    rows={4}
+                    style={{
+                      width: "100%",
+                      fontSize: 14,
+                      resize: "vertical",
+                      minHeight: 100,
+                    }}
+                  />
+                </div>
+
+                {errorMsg && (
+                  <div
+                    style={{
+                      padding: "12px",
+                      background: existingThreadId ? "var(--primary-soft)" : "var(--danger-soft)",
+                      border: `1px solid ${existingThreadId ? "var(--primary-color)" : "var(--danger)"}`,
+                      borderRadius: 8,
+                      color: existingThreadId ? "var(--primary-color)" : "var(--danger)",
+                      fontSize: 13,
+                    }}
+                  >
+                    {errorMsg}
+                    {existingThreadId && (
+                      <div style={{ marginTop: 8 }}>
+                        <button
+                          className="btn"
+                          onClick={handleOpenExistingThread}
+                          style={{
+                            padding: "6px 12px",
+                            fontSize: 12,
+                            fontWeight: 600,
+                            background: "var(--primary-color)",
+                            color: "white",
+                            border: "none",
+                            borderRadius: 6,
+                            cursor: "pointer",
+                          }}
+                        >
+                          Abrir conversa existente
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <div style={{ display: "flex", gap: 12, justifyContent: "flex-end", marginTop: 8 }}>
+                  <button
+                    className="btn soft"
+                    onClick={() => {
+                      setShowNewContactModal(false);
+                      setNewContactName("");
+                      setNewContactPhone("");
+                      setNewContactMessage("");
+                      setErrorMsg(null);
+                      setExistingThreadId(null);
+                    }}
+                    disabled={creatingContact}
+                    style={{
+                      padding: "10px 20px",
+                      fontSize: 14,
+                      fontWeight: 600,
+                    }}
+                  >
+                    Cancelar
+                  </button>
+                  <button
+                    className="btn"
+                    onClick={handleCreateContactAndSend}
+                    disabled={
+                      creatingContact ||
+                      !newContactName.trim() ||
+                      !newContactPhone.trim() ||
+                      !newContactMessage.trim()
+                    }
+                    style={{
+                      padding: "10px 20px",
+                      fontSize: 14,
+                      fontWeight: 600,
+                      background:
+                        creatingContact ||
+                        !newContactName.trim() ||
+                        !newContactPhone.trim() ||
+                        !newContactMessage.trim()
+                          ? "var(--muted)"
+                          : "var(--primary-color)",
+                      color: "white",
+                      border: "none",
+                      cursor:
+                        creatingContact ||
+                        !newContactName.trim() ||
+                        !newContactPhone.trim() ||
+                        !newContactMessage.trim()
+                          ? "not-allowed"
+                          : "pointer",
+                    }}
+                  >
+                    {creatingContact ? "Criando..." : "Criar e Enviar"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </>
       )}
     </div>
   );

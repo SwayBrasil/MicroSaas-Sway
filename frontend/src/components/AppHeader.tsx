@@ -142,7 +142,6 @@ export default function AppHeader() {
       {/* Navegação - Desktop */}
       {!isMobile && (
         <nav aria-label="Principal" style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
-          <NavBtn to="/dashboard" title="Dashboard"><span>📊 Dashboard</span></NavBtn>
           <NavBtn to="/" title="Chat"><span>Chat</span></NavBtn>
           <NavBtn to="/contacts" title="Contatos"><span>Contatos</span></NavBtn>
           <NavBtn to="/kanban" title="Kanban"><span>Kanban</span></NavBtn>

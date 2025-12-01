@@ -56,6 +56,7 @@ export type Thread = {
   last_message?: string | null;  // Preview da última mensagem
   last_message_at?: string | null;  // Data da última mensagem
   created_at?: string | null;  // Data de criação da thread
+  human_takeover?: boolean;  // Indica se o takeover humano está ativo
 };
 
 export type Message = {
@@ -63,7 +64,7 @@ export type Message = {
   role: "user" | "assistant";
   content: string;
   created_at?: string;
-  is_human?: boolean;
+  is_human?: boolean;  // Indica se a mensagem foi enviada por um humano (role="assistant" com is_human=true)
 };
 
 export type LoginResponse = { token: string };
@@ -130,9 +131,45 @@ export function logout() {
 }
 
 // ==================== Threads ====================
-export async function createThread(title: string = "Nova conversa"): Promise<Thread> {
-  const { data } = await api.post<Thread>("/threads", { title });
+export async function createThread(
+  title?: string,
+  options?: { phone?: string; name?: string }
+): Promise<Thread> {
+  const payload: { title?: string; phone?: string; name?: string } = {};
+  if (title) payload.title = title;
+  if (options?.phone) payload.phone = options.phone;
+  if (options?.name) payload.name = options.name;
+  
+  // Se não tiver título mas tiver nome, usa o nome como título
+  if (!payload.title && payload.name) {
+    payload.title = payload.name;
+  }
+  
+  // Se não tiver nada, usa padrão
+  if (!payload.title && !payload.phone && !payload.name) {
+    payload.title = "Nova conversa";
+  }
+  
+  const { data } = await api.post<Thread>("/threads", payload);
   return data;
+}
+
+/**
+ * Cria um novo contato (thread) e envia uma mensagem inicial
+ */
+export async function createContactAndSendMessage(
+  name: string,
+  phone: string,
+  message: string
+): Promise<{ thread: Thread; message: Message }> {
+  // Cria a thread com nome e telefone (takeover será ativado automaticamente no backend)
+  const thread = await createThread(undefined, { name, phone });
+  
+  // Envia a mensagem inicial como resposta humana (já que takeover está ativo)
+  // Isso faz a mensagem aparecer como enviada por você (lado direito)
+  const msg = await postHumanReply(Number(thread.id), message);
+  
+  return { thread, message: msg };
 }
 
 export async function listThreads(): Promise<Thread[]> {
@@ -227,9 +264,9 @@ export async function setTakeover(
 export async function postHumanReply(
   threadId: number,
   content: string
-): Promise<{ ok: boolean; message_id: number }> {
-  // Backend usa human-reply (com hífen)
-  const { data } = await api.post<{ ok: boolean; message_id: number }>(
+): Promise<Message> {
+  // Backend usa human-reply (com hífen) e retorna MessageRead
+  const { data } = await api.post<Message>(
     `/threads/${threadId}/human-reply`,
     { content }
   );
